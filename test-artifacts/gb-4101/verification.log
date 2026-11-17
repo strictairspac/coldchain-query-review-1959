@@ -1,0 +1,68 @@
+### gb-4101 final verification (2026-11-17T09:10:44+00:00)
+### E2E (7 groups, 36 assertions)
+
+[1] 受理即冻结：批次带快照表/冻结语句/校验和，快照表存在且 600 行，worker 未启动也已冻结
+  OK 受理返回 202  202
+  OK 返回冻结快照表名  invoices_snapshot_47
+  OK 返回两侧冻结语句
+  OK 返回快照行数与 SHA-256 校验和
+  OK 数据库中快照表实际 600 行
+  OK query_reader 获快照 SELECT 权限
+  OK 无 worker 时批次停在 queued
+
+[2] 比较中改账：先更正主表再启动 worker，证据仍按冻结快照产出且 passed
+  OK 主表已更正且与快照金额不同  live=604425.00 frozen=554425.00
+  OK 批次到达终态  passed
+  OK 证据可读且来源为冻结快照
+  OK 按冻结口径判定 passed（改账不影响该批比较）  passed
+  OK 证据 freeze_basis 行数 600
+  OK 导出 JSON 包含冻结依据
+
+[3] 执行中断恢复：崩溃留下 running+过期租约，恢复后同份依据完成且证据唯一
+  OK 崩溃批次被恢复并完成  passed
+  OK 重试不重复生成证据（仅 1 条）
+  OK 恢复后仍使用同份冻结依据
+  OK attempts 记录再次领取  2
+  OK 证据文件只写一次
+
+[4] 并发领取：有效租约他人不可领取/发布；过期后新执行者发布，旧执行者不能覆盖
+  OK 有效租约期间并发领取被拒绝
+  OK 非持有者发布被拒绝
+  OK token 错误的持有者不能发布
+  OK 租约过期后可被新执行者领取
+  OK 当前执行者发布成功
+  OK 过期执行者不能覆盖（already_done）
+  OK 终态未被过期执行者改写
+  OK 证据与状态同事务落库
+
+[5] 冻结失败整批不受理：模拟快照异常，批次不留痕、不进队列
+  OK 冻结失败抛 503 且整批不受理  503: 账单冻结失败，整批不受理：simulated freeze failure
+  OK 失败批次未入库
+
+[6] 只读权限/查询限额/比较口径保留；viewer 写请求被拒
+  OK viewer 创建批次 403
+  OK viewer 创建样本 403
+  OK viewer 只读查询可用
+  OK 多语句拒绝 422
+  OK 跨表拒绝 422
+  OK 原比较口径保留（含 missing/extra 与双侧摘要）  passed
+
+[7] 旧证据（v1，无冻结列）照常可读
+  OK 旧证据可读且内容原样
+  OK 旧证据 freeze_basis 为空不报错
+
+==== 通过 36 / 失败 0 ====
+
+### CONCURRENCY STRESS (12 threads, same batch)
+成功领取数 = 1 (期望 1)
+成功发布数 = 1 (期望 1)
+DB 状态 = passed  attempts = 1  证据数 = 1
+CONCURRENCY STRESS OK
+
+### REAL SIGKILL CRASH RECOVERY
+批次 54 已冻结于 invoices_snapshot_54
+worker 已 SIGKILL（compare 进行中）
+中断后状态 = running  租约持有者 = worker-18ebe819ab506b24  领取次数 = 1
+恢复后终态 = passed
+恢复后领取次数 = 2  证据来源 = invoices_snapshot_54
+SIGKILL 恢复测试 OK：同份依据、证据唯一、attempts=2

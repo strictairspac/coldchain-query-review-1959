@@ -11,6 +11,8 @@ from sqlalchemy import text
 from .services.batch import queue
 @asynccontextmanager
 async def lifespan(app):
+    from .config.schema import ensure_schema
+    ensure_schema()
     if os.getenv('SEED_DEMO','true')=='true':
         try:
             from scripts.seed_demo import seed

@@ -21,23 +21,36 @@ def validate_sql(sql):
         if f.sql_name() not in ALLOWED_FUNCTIONS: raise ValueError('不允许函数：'+f.sql_name())
     if len(list(tree.walk()))>250: raise ValueError('SQL 结构过大')
     return tree.sql(dialect='postgres')
-def execute_query(sql):
+def _bind_snapshot(sql,snapshot_table):
+    """白名单校验通过后，把 AST 中的 invoices 重写到该批次冻结的快照表。
+
+    只在服务端执行重写；用户 SQL 仍必须且只能引用 invoices，无法触碰其他表。
+    """
+    trees=sqlglot.parse(sql,read='postgres')
+    tree=trees[0]
+    for node in tree.find_all(exp.Table):
+        if node.name=='invoices' and not node.db and not node.catalog:
+            node.set('this',exp.to_identifier(snapshot_table))
+    return tree.sql(dialect='postgres')
+def execute_query(sql,snapshot_table=None):
     sql=validate_sql(sql)
+    target_sql=_bind_snapshot(sql,snapshot_table) if snapshot_table else sql
     with engine.connect() as conn:
         with conn.begin():
             conn.execute(text('SET TRANSACTION READ ONLY'))
             conn.execute(text("SET LOCAL statement_timeout='2500ms'"))
             conn.execute(text('SET LOCAL ROLE query_reader'))
-            plan=conn.execute(text('EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS) '+sql)).scalar()
+            plan=conn.execute(text('EXPLAIN (ANALYZE, FORMAT JSON, BUFFERS) '+target_sql)).scalar()
             started=time.perf_counter()
-            cursor=conn.execute(text(sql)); columns=list(cursor.keys()); rows=cursor.fetchmany(1001)
+            cursor=conn.execute(text(target_sql)); columns=list(cursor.keys()); rows=cursor.fetchmany(1001)
             if len(rows)>1000: raise ValueError('结果超过 1000 行，请聚合或 LIMIT')
             rows=[[str(v) if v is not None else None for v in row] for row in rows]
-            return {'columns':columns,'rows':rows,'row_count':len(rows),'elapsed_ms':round((time.perf_counter()-started)*1000,3),'plan':plan}
-def compare(original,candidate):
-    left=execute_query(original);right=execute_query(candidate)
+            return {'columns':columns,'rows':rows,'row_count':len(rows),'elapsed_ms':round((time.perf_counter()-started)*1000,3),'plan':plan,'source_table':snapshot_table or 'invoices'}
+def compare(original,candidate,snapshot_table=None):
+    # 两侧语句在同一份冻结快照上执行，比较口径保持不变
+    left=execute_query(original,snapshot_table);right=execute_query(candidate,snapshot_table)
     canon=lambda data:Counter(json.dumps(row,ensure_ascii=False) for row in data['rows'])
     a,b=canon(left),canon(right)
     equivalent=len(left['columns'])==len(right['columns']) and a==b
     digest=lambda x:hashlib.sha256(json.dumps(sorted(canon(x).items()),ensure_ascii=False).encode()).hexdigest()
-    return {'equivalent':equivalent,'comparison':'忽略行顺序、保留重复行；按输出列位置比较，数字按数据库文本表示','original':left,'candidate':right,'original_checksum':digest(left),'candidate_checksum':digest(right),'missing_rows':list((a-b).elements())[:10],'extra_rows':list((b-a).elements())[:10],'note':'执行时间受缓存与机器负载影响；不据一次耗时断言优化收益'}
+    return {'equivalent':equivalent,'comparison':'忽略行顺序、保留重复行；按输出列位置比较，数字按数据库文本表示','original':left,'candidate':right,'original_checksum':digest(left),'candidate_checksum':digest(right),'missing_rows':list((a-b).elements())[:10],'extra_rows':list((b-a).elements())[:10],'frozen_source':snapshot_table or None,'note':'执行时间受缓存与机器负载影响；不据一次耗时断言优化收益'}
